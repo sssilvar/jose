@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::jwt::parse_jwt_claims;
 
@@ -39,10 +41,13 @@ impl AuthData {
         let content = serde_json::to_string_pretty(self)?;
         fs::write(&path, &content)?;
 
-        // Set file permissions to 600 (owner read/write only)
-        let mut perms = fs::metadata(&path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path, perms)?;
+        // Set file permissions to 600 (owner read/write only) - Unix only
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&path, perms)?;
+        }
 
         Ok(())
     }
