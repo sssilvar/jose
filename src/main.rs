@@ -18,6 +18,7 @@ use crate::oauth::do_login;
 
 #[derive(Parser)]
 #[command(name = "jose")]
+#[command(version)]
 #[command(about = "CLI tool using ChatGPT subscription for shell commands", long_about = None)]
 struct Cli {
     #[command(subcommand)]
