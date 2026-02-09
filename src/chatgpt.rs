@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 
 use crate::auth::{get_valid_tokens, Tokens};
 use crate::config::CHATGPT_RESPONSES_URL;
+use crate::shell::{detect_shell, os_name};
 
 pub fn call_chatgpt(prompt: &str, model: &str) -> Result<String> {
     let tokens = get_valid_tokens()?
@@ -12,21 +13,15 @@ pub fn call_chatgpt(prompt: &str, model: &str) -> Result<String> {
 }
 
 fn call_with_tokens(prompt: &str, model: &str, tokens: &Tokens) -> Result<String> {
-    let os_name = if cfg!(target_os = "macos") {
-        "macOS"
-    } else if cfg!(target_os = "linux") {
-        "Linux"
-    } else if cfg!(target_os = "windows") {
-        "Windows"
-    } else {
-        "Unix"
-    };
+    let os = os_name();
+    let shell = detect_shell();
 
     let system_prompt = format!(
-        r#"You are an expert shell command generator for {}.
+        r#"You are an expert shell command generator for {} using {}.
 Respond with ONLY the exact shell command. No explanation. No markdown. No backticks.
 If there are alternatives, put them on separate lines."#,
-        os_name
+        os,
+        shell.name()
     );
 
     let payload = serde_json::json!({

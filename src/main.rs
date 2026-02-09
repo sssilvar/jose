@@ -5,6 +5,7 @@ mod config;
 mod jwt;
 mod log;
 mod oauth;
+mod shell;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
