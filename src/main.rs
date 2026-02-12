@@ -6,6 +6,7 @@ mod jwt;
 mod log;
 mod oauth;
 mod shell;
+mod interactive;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -16,6 +17,7 @@ use crate::clipboard::copy_to_clipboard;
 use crate::config::Config;
 use crate::jwt::parse_jwt_claims;
 use crate::oauth::do_login;
+use crate::interactive::run_interactive;
 
 #[derive(Parser)]
 #[command(name = "jose")]
@@ -24,6 +26,10 @@ use crate::oauth::do_login;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Start interactive chat UI mode
+    #[arg(short, long)]
+    interactive: bool,
 
     /// Prompt for command generation (when no subcommand is used)
     #[arg(trailing_var_arg = true)]
@@ -124,6 +130,20 @@ fn cmd_query(prompt: &str, model: Option<&str>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.interactive {
+        if cli.command.is_some() {
+            log::error("`--interactive` cannot be used with subcommands.");
+            std::process::exit(1);
+        }
+        if !cli.prompt.is_empty() {
+            log::error("`--interactive` cannot be used with a prompt argument.");
+            std::process::exit(1);
+        }
+
+        run_interactive(cli.model.as_deref())?;
+        return Ok(());
+    }
 
     match cli.command {
         Some(Commands::Login) => {
