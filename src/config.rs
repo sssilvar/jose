@@ -12,6 +12,17 @@ pub const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/r
 /// Must use port 1455 - this is the only port registered with OpenAI's OAuth
 pub const OAUTH_PORT: u16 = 1455;
 
+/// Models available for command generation (per OpenAI Codex docs).
+pub const AVAILABLE_MODELS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
+
+/// Default model: a fast, low-cost mini model.
+pub const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_model: String,
@@ -20,7 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            default_model: "gpt-5-codex".to_string(),
+            default_model: DEFAULT_MODEL.to_string(),
         }
     }
 }

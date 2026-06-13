@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use crate::auth::AuthData;
 use crate::chatgpt::call_chatgpt;
 use crate::clipboard::copy_to_clipboard;
-use crate::config::Config;
+use crate::config::{Config, AVAILABLE_MODELS};
 use crate::jwt::parse_jwt_claims;
 use crate::oauth::do_login;
 
@@ -40,8 +40,17 @@ enum Commands {
     Login,
     /// Show authentication status
     Info,
+    /// Show the current model and available models, or set a new one
+    Model {
+        #[command(subcommand)]
+        command: Option<ModelCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCommands {
     /// Set the default model
-    SetModel {
+    Set {
         /// The model name to set as default
         model: String,
     },
@@ -70,7 +79,27 @@ fn cmd_info() -> Result<()> {
     Ok(())
 }
 
-fn cmd_set_model(model: &str) -> Result<()> {
+fn cmd_model_show() -> Result<()> {
+    let config = Config::load()?;
+    log::success(&format!("Current model: {}", config.default_model));
+    log::info("Available models:");
+    for model in AVAILABLE_MODELS {
+        if *model == config.default_model {
+            log::command(&format!("{} (current)", model));
+        } else {
+            log::command(model);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_model_set(model: &str) -> Result<()> {
+    if !AVAILABLE_MODELS.contains(&model) {
+        log::warn(&format!(
+            "`{}` is not in the known model list. Setting it anyway.",
+            model
+        ));
+    }
     let mut config = Config::load()?;
     config.default_model = model.to_string();
     config.save()?;
@@ -136,9 +165,10 @@ fn main() -> Result<()> {
         Some(Commands::Info) => {
             cmd_info()?;
         }
-        Some(Commands::SetModel { model }) => {
-            cmd_set_model(&model)?;
-        }
+        Some(Commands::Model { command }) => match command {
+            None => cmd_model_show()?,
+            Some(ModelCommands::Set { model }) => cmd_model_set(&model)?,
+        },
         None => {
             if cli.prompt.is_empty() {
                 log::error("Please provide a prompt or use a subcommand.");
