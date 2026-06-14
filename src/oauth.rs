@@ -1,16 +1,10 @@
 use anyhow::{Context, Result};
-use axum::{
-    extract::{Query, State},
-    response::{Html, Redirect},
-    routing::get,
-    Router,
-};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::distr::{Alphanumeric, SampleString};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 
 use crate::auth::{AuthData, Tokens};
 use crate::config::{CLIENT_ID, OAUTH_ISSUER, OAUTH_PORT, OAUTH_TOKEN_URL};
@@ -26,7 +20,6 @@ pub struct PkceCodes {
 impl PkceCodes {
     pub fn generate() -> Self {
         let code_verifier: String = Alphanumeric.sample_string(&mut rand::rng(), 128);
-
         let digest = Sha256::digest(code_verifier.as_bytes());
         let code_challenge = URL_SAFE_NO_PAD.encode(digest);
 
@@ -37,17 +30,12 @@ impl PkceCodes {
     }
 }
 
-#[derive(Clone)]
-struct OAuthState {
-    pkce: PkceCodes,
-    #[allow(dead_code)] // Reserved for OAuth state validation
-    state: String,
-    tokens: Arc<Mutex<Option<Tokens>>>,
-    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+fn redirect_uri() -> String {
+    format!("http://localhost:{}/auth/callback", OAUTH_PORT)
 }
 
 pub fn build_auth_url(pkce: &PkceCodes, state: &str) -> String {
-    let redirect_uri = format!("http://localhost:{}/auth/callback", OAUTH_PORT);
+    let redirect_uri = redirect_uri();
 
     let params = [
         ("response_type", "code"),
@@ -71,8 +59,7 @@ pub fn build_auth_url(pkce: &PkceCodes, state: &str) -> String {
 }
 
 fn exchange_code(code: &str, pkce: &PkceCodes) -> Result<Tokens> {
-    let redirect_uri = format!("http://localhost:{}/auth/callback", OAUTH_PORT);
-
+    let redirect_uri = redirect_uri();
     let client = reqwest::blocking::Client::new();
 
     let body = format!(
@@ -131,131 +118,113 @@ fn exchange_code(code: &str, pkce: &PkceCodes) -> Result<Tokens> {
     })
 }
 
-async fn handle_callback(
-    Query(params): Query<HashMap<String, String>>,
-    State(state): State<OAuthState>,
-) -> Result<Redirect, Html<String>> {
-    let code = match params.get("code") {
-        Some(c) => c,
-        None => {
-            return Err(Html(
-                "<h1>Error</h1><p>Missing authorization code</p>".to_string(),
-            ));
-        }
-    };
-
-    // Exchange code for tokens (blocking call in async context)
-    let pkce = state.pkce.clone();
-    let code = code.clone();
-
-    let tokens = tokio::task::spawn_blocking(move || exchange_code(&code, &pkce))
-        .await
-        .map_err(|e| Html(format!("<h1>Error</h1><p>{}</p>", e)))?
-        .map_err(|e| Html(format!("<h1>Error</h1><p>{}</p>", e)))?;
-
-    // Store tokens
-    *state.tokens.lock().unwrap() = Some(tokens);
-
-    // Signal shutdown
-    if let Some(tx) = state.shutdown_tx.lock().unwrap().take() {
-        let _ = tx.send(());
-    }
-
-    Ok(Redirect::to(&format!(
-        "http://localhost:{}/success",
-        OAUTH_PORT
-    )))
+/// Parse the query string of the request line `GET /path?query HTTP/1.1`.
+fn parse_request_query(request_line: &str) -> HashMap<String, String> {
+    request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|path| path.split_once('?'))
+        .map(|(_, query)| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        urlencoding::decode(v).map(|s| s.into_owned()).unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-async fn handle_success() -> Html<&'static str> {
-    Html(
-        r#"
-        <html>
-        <head><title>Login Successful</title></head>
-        <body style="font-family: system-ui; max-width: 600px; margin: 80px auto;">
-            <h1>✅ Login Successful!</h1>
-            <p>You can close this window and return to the terminal.</p>
-        </body>
-        </html>
-        "#,
+const SUCCESS_HTML: &str = r#"<html>
+<head><title>Login Successful</title></head>
+<body style="font-family: system-ui; max-width: 600px; margin: 80px auto;">
+    <h1>Login Successful</h1>
+    <p>You can close this window and return to the terminal.</p>
+</body>
+</html>"#;
+
+fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
+}
+
+/// Block on a one-shot HTTP server until the OAuth callback delivers a code.
+fn wait_for_callback(listener: &TcpListener, pkce: &PkceCodes, state: &str) -> Result<Tokens> {
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+
+        let mut request_line = String::new();
+        BufReader::new(&stream).read_line(&mut request_line)?;
+
+        // Ignore anything that isn't the OAuth callback (e.g. favicon).
+        if !request_line.contains("/auth/callback") {
+            let _ = stream.write_all(http_response("404 Not Found", "Not found").as_bytes());
+            continue;
+        }
+
+        let params = parse_request_query(&request_line);
+
+        if params.get("state").map(String::as_str) != Some(state) {
+            let _ = stream.write_all(
+                http_response("400 Bad Request", "<h1>Error</h1><p>State mismatch</p>").as_bytes(),
+            );
+            anyhow::bail!("OAuth state mismatch - possible CSRF, aborting.");
+        }
+
+        let code = params
+            .get("code")
+            .ok_or_else(|| anyhow::anyhow!("Missing authorization code in callback"))?;
+
+        let tokens = exchange_code(code, pkce)?;
+        let _ = stream.write_all(http_response("200 OK", SUCCESS_HTML).as_bytes());
+        let _ = stream.flush();
+        return Ok(tokens);
+    }
+
+    anyhow::bail!("Listener closed before receiving callback")
 }
 
 pub fn do_login() -> Result<bool> {
     log::info("Starting OAuth login flow...");
-    log::dim(&format!(
-        "Note: Make sure port {} is not in use",
-        OAUTH_PORT
-    ));
+    log::dim(&format!("Note: Make sure port {} is not in use", OAUTH_PORT));
 
     let pkce = PkceCodes::generate();
     let state_token: String = Alphanumeric.sample_string(&mut rand::rng(), 64);
+
+    let addr = format!("127.0.0.1:{}", OAUTH_PORT);
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error(&format!("Port {} is already in use.", OAUTH_PORT));
+            log::info("Make sure ChatMock or another instance is not running.");
+            return Err(anyhow::anyhow!("Failed to bind: {}", e));
+        }
+    };
 
     let auth_url = build_auth_url(&pkce, &state_token);
 
     log::info("Opening browser for authentication...");
     log::dim(&format!("If browser doesn't open, visit:\n{}", auth_url));
 
-    // Open browser
     if let Err(e) = open::that(&auth_url) {
         log::warn(&format!("Failed to open browser: {}", e));
     }
 
-    // Create tokio runtime for the server
-    let rt = tokio::runtime::Runtime::new()?;
+    log::info("Waiting for authentication callback...");
 
-    let result = rt.block_on(async {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let tokens = wait_for_callback(&listener, &pkce, &state_token)?;
 
-        let oauth_state = OAuthState {
-            pkce,
-            state: state_token,
-            tokens: Arc::new(Mutex::new(None)),
-            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-        };
-
-        let tokens_ref = oauth_state.tokens.clone();
-
-        let app = Router::new()
-            .route("/auth/callback", get(handle_callback))
-            .route("/success", get(handle_success))
-            .with_state(oauth_state);
-
-        let addr = format!("127.0.0.1:{}", OAUTH_PORT);
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::error(&format!("Port {} is already in use.", OAUTH_PORT));
-                log::info("Make sure ChatMock or another instance is not running.");
-                return Err(anyhow::anyhow!("Failed to bind: {}", e));
-            }
-        };
-
-        log::info("Waiting for authentication callback...");
-
-        // Serve until we get a shutdown signal
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-                // Give time for the success page to be served
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            })
-            .await?;
-
-        let tokens = tokens_ref.lock().unwrap().take();
-        Ok(tokens)
-    })?;
-
-    if let Some(tokens) = result {
-        let auth = AuthData {
-            tokens,
-            last_refresh: chrono::Utc::now().to_rfc3339(),
-        };
-        auth.save()?;
-        log::success("Login successful! Credentials saved.");
-        Ok(true)
-    } else {
-        log::error("Login failed.");
-        Ok(false)
-    }
+    let auth = AuthData {
+        tokens,
+        last_refresh: chrono::Utc::now().to_rfc3339(),
+    };
+    auth.save()?;
+    log::success("Login successful! Credentials saved.");
+    Ok(true)
 }

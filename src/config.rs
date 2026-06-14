@@ -12,7 +12,8 @@ pub const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/r
 /// Must use port 1455 - this is the only port registered with OpenAI's OAuth
 pub const OAUTH_PORT: u16 = 1455;
 
-/// Models available for command generation (per OpenAI Codex docs).
+/// Models known to the ChatGPT subscription backend (per OpenAI Codex docs).
+/// Only used for the `chatgpt` provider; openai-compatible models are free-form.
 pub const AVAILABLE_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-5.4",
@@ -23,15 +24,47 @@ pub const AVAILABLE_MODELS: &[&str] = &[
 /// Default model: a fast, low-cost mini model.
 pub const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 
+/// Backend used to generate commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    /// ChatGPT subscription backend via OAuth (default).
+    #[default]
+    Chatgpt,
+    /// Any OpenAI-compatible `/v1` server (ollama, llama.cpp, vLLM, ...).
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::Chatgpt => "chatgpt",
+            ProviderKind::OpenAiCompatible => "openai-compatible",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub provider: ProviderKind,
     pub default_model: String,
+    /// Base URL for openai-compatible provider, e.g. `https://foo.bar/v1`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional API key for openai-compatible provider.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            provider: ProviderKind::default(),
             default_model: DEFAULT_MODEL.to_string(),
+            base_url: None,
+            api_key: None,
         }
     }
 }
@@ -55,6 +88,20 @@ impl Config {
         let content = serde_json::to_string_pretty(self)?;
         fs::write(&path, content)?;
         Ok(())
+    }
+
+    /// Base URL, env (`JOSE_BASE_URL`) taking precedence over the config file.
+    pub fn base_url(&self) -> Option<String> {
+        std::env::var("JOSE_BASE_URL")
+            .ok()
+            .or_else(|| self.base_url.clone())
+    }
+
+    /// API key, env (`JOSE_API_KEY`) taking precedence over the config file.
+    pub fn api_key(&self) -> Option<String> {
+        std::env::var("JOSE_API_KEY")
+            .ok()
+            .or_else(|| self.api_key.clone())
     }
 
     fn config_path() -> Result<PathBuf> {

@@ -1,19 +1,19 @@
 mod auth;
-mod chatgpt;
 mod clipboard;
 mod config;
 mod jwt;
 mod log;
 mod oauth;
+mod prompt;
+mod provider;
 mod shell;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::auth::AuthData;
-use crate::chatgpt::call_chatgpt;
 use crate::clipboard::copy_to_clipboard;
-use crate::config::{Config, AVAILABLE_MODELS};
+use crate::config::{Config, ProviderKind, AVAILABLE_MODELS};
 use crate::jwt::parse_jwt_claims;
 use crate::oauth::do_login;
 
@@ -45,6 +45,11 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ModelCommands>,
     },
+    /// Show the current provider, or switch/configure one
+    Provider {
+        #[command(subcommand)]
+        command: Option<ProviderCommands>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -53,6 +58,31 @@ enum ModelCommands {
     Set {
         /// The model name to set as default
         model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderCommands {
+    /// Set the active provider
+    Set {
+        #[command(subcommand)]
+        kind: ProviderSet,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderSet {
+    /// Use the ChatGPT subscription backend (OAuth)
+    Chatgpt,
+    /// Use an OpenAI-compatible server (ollama, llama.cpp, vLLM, ...)
+    #[command(name = "openai-compatible")]
+    OpenAiCompatible {
+        /// Base URL including the version path, e.g. https://foo.bar/v1
+        #[arg(long)]
+        base_url: String,
+        /// Optional API key (sent as a Bearer token)
+        #[arg(long)]
+        api_key: Option<String>,
     },
 }
 
@@ -94,16 +124,54 @@ fn cmd_model_show() -> Result<()> {
 }
 
 fn cmd_model_set(model: &str) -> Result<()> {
-    if !AVAILABLE_MODELS.contains(&model) {
+    let mut config = Config::load()?;
+    // The known-model list only applies to the ChatGPT backend; openai-compatible
+    // servers expose arbitrary model names.
+    if config.provider == ProviderKind::Chatgpt && !AVAILABLE_MODELS.contains(&model) {
         log::warn(&format!(
             "`{}` is not in the known model list. Setting it anyway.",
             model
         ));
     }
-    let mut config = Config::load()?;
     config.default_model = model.to_string();
     config.save()?;
     log::success(&format!("Default model set to: {}", model));
+    Ok(())
+}
+
+fn cmd_provider_show() -> Result<()> {
+    let config = Config::load()?;
+    log::success(&format!("Current provider: {}", config.provider.as_str()));
+    if config.provider == ProviderKind::OpenAiCompatible {
+        match config.base_url() {
+            Some(url) => log::info(&format!("Base URL: {}", url)),
+            None => log::warn("No base URL set (use `provider set openai-compatible --base-url`)"),
+        }
+        log::info(&format!(
+            "API key: {}",
+            if config.api_key().is_some() { "set" } else { "none" }
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_provider_set(set: &ProviderSet) -> Result<()> {
+    let mut config = Config::load()?;
+    match set {
+        ProviderSet::Chatgpt => {
+            config.provider = ProviderKind::Chatgpt;
+            log::success("Provider set to: chatgpt");
+        }
+        ProviderSet::OpenAiCompatible { base_url, api_key } => {
+            config.provider = ProviderKind::OpenAiCompatible;
+            config.base_url = Some(base_url.clone());
+            if api_key.is_some() {
+                config.api_key = api_key.clone();
+            }
+            log::success(&format!("Provider set to: openai-compatible ({})", base_url));
+        }
+    }
+    config.save()?;
     Ok(())
 }
 
@@ -113,10 +181,10 @@ fn cmd_query(prompt: &str, model: Option<&str>) -> Result<()> {
 
     log::info(&format!("Querying {}...", model));
 
-    let result = call_chatgpt(prompt, model)?;
+    let result = provider::generate(&config, prompt, model)?;
 
     if result.is_empty() {
-        anyhow::bail!("Empty response from ChatGPT");
+        anyhow::bail!("Empty response from provider");
     }
 
     // Get first line as main command
@@ -168,6 +236,10 @@ fn main() -> Result<()> {
         Some(Commands::Model { command }) => match command {
             None => cmd_model_show()?,
             Some(ModelCommands::Set { model }) => cmd_model_set(&model)?,
+        },
+        Some(Commands::Provider { command }) => match command {
+            None => cmd_provider_show()?,
+            Some(ProviderCommands::Set { kind }) => cmd_provider_set(&kind)?,
         },
         None => {
             if cli.prompt.is_empty() {

@@ -1,6 +1,6 @@
 //! Cross-platform logging utilities with colored output
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 /// ANSI color codes
 pub mod colors {
@@ -20,7 +20,7 @@ fn supports_color() -> bool {
         return false;
     }
     // Check if stdout is a terminal
-    atty::is(atty::Stream::Stdout)
+    io::stdout().is_terminal()
 }
 
 /// Format text with color if supported
