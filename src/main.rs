@@ -179,7 +179,13 @@ fn cmd_query(prompt: &str, model: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let model = model.unwrap_or(&config.default_model);
 
-    log::info(&format!("Querying {}...", model));
+    match config.provider {
+        ProviderKind::Chatgpt => log::info(&format!("Querying chatgpt ({})...", model)),
+        ProviderKind::OpenAiCompatible => {
+            let target = config.base_url().unwrap_or_else(|| "<unset>".to_string());
+            log::info(&format!("Querying {} ({})...", target, model));
+        }
+    }
 
     let result = provider::generate(&config, prompt, model)?;
 
